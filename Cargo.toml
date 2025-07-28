@@ -1,0 +1,14 @@
+[package]
+name = "qduct"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+bytes = "1.10.1"
+clap = { version = "4.5.41", features = ["derive"] }
+quinn = "0.11.8"
+rcgen = "0.14.3"
+tokio = { version = "1.47.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19"}
