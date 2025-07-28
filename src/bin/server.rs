@@ -17,10 +17,10 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Debug, clap::Parser)]
 struct ServerArgs {
     /// The listen address of this QUIC server
-    #[clap(long, short = 'S')]
+    #[clap(long, short)]
     server: SocketAddr,
     /// The address to forward received data to
-    #[clap(long, short = 's')]
+    #[clap(long, short)]
     local_sink: SocketAddr,
     #[clap(flatten)]
     common: qduct::CommonArgs,

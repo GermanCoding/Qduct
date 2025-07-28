@@ -20,10 +20,10 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Debug, clap::Parser)]
 struct ClientArgs {
     /// The address of the QUIC server (the other party)
-    #[clap(long, short = 'R')]
+    #[clap(long, short)]
     remote: SocketAddr,
     /// The address to receive data to forward on
-    #[clap(long, short = 'r')]
+    #[clap(long, short)]
     local_source: SocketAddr,
     #[clap(flatten)]
     common: qduct::CommonArgs,
