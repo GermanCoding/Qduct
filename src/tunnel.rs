@@ -10,7 +10,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::SetOnce;
 use tracing::debug;
 use tracing::log::info;
 
@@ -67,11 +66,10 @@ impl Server {
         let connection = incoming.accept()?.await?;
         let tunnel = UdpTunnel {
             udp_server,
-            udp_destination: SetOnce::new(),
+            preset_udp_destination: Some(self.udp_destination),
             endpoint,
             connection,
         };
-        tunnel.udp_destination.set(self.udp_destination)?;
         Ok(tunnel)
     }
 }
@@ -109,7 +107,7 @@ impl Client {
         let connection = endpoint.connect(remote_server, SERVER_NAME)?.await?;
         let tunnel = UdpTunnel {
             udp_server,
-            udp_destination: SetOnce::new(),
+            preset_udp_destination: None,
             endpoint,
             connection,
         };
@@ -119,7 +117,7 @@ impl Client {
 
 pub struct UdpTunnel {
     udp_server: UdpSocket,
-    udp_destination: SetOnce<SocketAddr>,
+    preset_udp_destination: Option<SocketAddr>,
     #[allow(dead_code)]
     endpoint: Endpoint,
     connection: Connection,
@@ -129,20 +127,25 @@ impl UdpTunnel {
     pub async fn run(self) -> anyhow::Result<()> {
         let udp_server_1 = Arc::new(self.udp_server);
         let udp_server_2 = Arc::clone(&udp_server_1);
-        let udp_destination_1 = Arc::new(self.udp_destination);
-        let udp_destination_2 = Arc::clone(&udp_destination_1);
+        let (new_udp_destination_sender, mut new_udp_destination_receiver) =
+            tokio::sync::mpsc::channel(10);
         let connection_1 = Arc::new(self.connection);
         let connection_2 = Arc::clone(&connection_1);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        if let Some(initial_destination) = self.preset_udp_destination {
+            new_udp_destination_sender.try_send(initial_destination)?;
+        }
+
         let udp_receive: tokio::task::JoinHandle<anyhow::Result<()>> =
             tokio::task::spawn(async move {
-                let mut destination_set = udp_destination_1.initialized();
+                let mut last_destination = None;
                 loop {
                     let mut buf = BytesMut::with_capacity(BUF_SIZE);
                     let (_size, addr) = udp_server_1.recv_buf_from(&mut buf).await?;
-                    if !destination_set {
-                        destination_set = true;
-                        udp_destination_1.set(addr).ok();
+                    if Some(addr) != last_destination {
+                        last_destination = Some(addr);
+                        new_udp_destination_sender.try_send(addr).ok();
                     }
                     sender.send(buf.freeze())?;
                 }
@@ -160,14 +163,24 @@ impl UdpTunnel {
             });
         let quic_receive: tokio::task::JoinHandle<anyhow::Result<()>> =
             tokio::task::spawn(async move {
+                let mut destination = None;
                 loop {
-                    let mut inbound = connection_2.accept_uni().await?;
-                    let data = inbound.read_to_end(BUF_SIZE).await?;
-                    if let Some(destination) = udp_destination_2.get() {
-                        udp_server_2.send_to(&data, destination).await?;
+                    tokio::select! {
+                        biased;
+                        new_destination = new_udp_destination_receiver.recv() => {
+                            destination = new_destination;
+                        },
+                        accept_uni = connection_2.accept_uni() => {
+                            let mut inbound = accept_uni?;
+                            let data = inbound.read_to_end(BUF_SIZE).await?;
+                             if let Some(destination) = destination {
+                                udp_server_2.send_to(&data, destination).await?;
+                            }
+                        }
                     }
                 }
             });
+
         tokio::select! {
             udp_receive = udp_receive => udp_receive??,
             quic_send = quic_send => quic_send??,
@@ -236,7 +249,6 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use tokio::task::JoinHandle;
-    use tokio::time::Instant;
 
     const UNSPECIFIED_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
 
