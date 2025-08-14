@@ -1,7 +1,7 @@
 use clap::Parser;
 use qduct::tunnel::Client;
 use std::net::SocketAddr;
-use tracing::log::info;
+use tracing::log::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,9 +12,18 @@ async fn main() -> anyhow::Result<()> {
         args.local_source
     );
     let client = Client::try_new(args.local_source).await?;
-    let tunnel = client.connect(args.remote).await?;
-    info!("Connected! Forwarding data...");
-    tunnel.run().await
+    loop {
+        let tunnel = client.connect(args.remote).await?;
+        info!("Connected! Forwarding data...");
+        match tunnel.run().await {
+            Ok(()) => {
+                info!("Connection closed.");
+            }
+            Err(e) => {
+                warn!("Connection failed: {e:#}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, clap::Parser)]

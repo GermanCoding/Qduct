@@ -19,7 +19,7 @@ const SERVER_NAME: &str = "Qduct";
 
 pub struct Server {
     endpoint: Endpoint,
-    udp_server: UdpSocket,
+    udp_server: Arc<UdpSocket>,
     udp_destination: SocketAddr,
     pub certificate: CertificateDer<'static>,
 }
@@ -34,7 +34,7 @@ impl Server {
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
-        let udp_server = UdpSocket::bind((bind_ip, 0)).await?;
+        let udp_server = Arc::new(UdpSocket::bind((bind_ip, 0)).await?);
         let keypair = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()])?;
         let certificate = CertificateDer::from(keypair.cert);
         let priv_key = PrivatePkcs8KeyDer::from(keypair.signing_key.serialize_der());
@@ -53,9 +53,9 @@ impl Server {
         })
     }
 
-    pub async fn accept(self) -> anyhow::Result<UdpTunnel> {
-        let udp_server = self.udp_server;
-        let endpoint = self.endpoint;
+    pub async fn accept(&self) -> anyhow::Result<UdpTunnel> {
+        let udp_server = self.udp_server.clone();
+        let endpoint = &self.endpoint;
         let quic_addr = endpoint.local_addr()?;
         info!("Waiting for incoming QUIC connection on {quic_addr}...");
         let incoming = endpoint.accept().await.unwrap(/* Infallible */);
@@ -67,7 +67,6 @@ impl Server {
         let tunnel = UdpTunnel {
             udp_server,
             preset_udp_destination: Some(self.udp_destination),
-            endpoint,
             connection,
         };
         Ok(tunnel)
@@ -75,13 +74,13 @@ impl Server {
 }
 
 pub struct Client {
-    udp_server: UdpSocket,
+    udp_server: Arc<UdpSocket>,
     endpoint: Endpoint,
 }
 
 impl Client {
     pub async fn try_new(udp_sink: SocketAddr) -> anyhow::Result<Self> {
-        let udp_server = UdpSocket::bind(udp_sink).await?;
+        let udp_server = Arc::new(UdpSocket::bind(udp_sink).await?);
         let config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(BypassCertificateVerifier::new())
@@ -100,15 +99,14 @@ impl Client {
         })
     }
 
-    pub async fn connect(self, remote_server: SocketAddr) -> anyhow::Result<UdpTunnel> {
-        let endpoint = self.endpoint;
-        let udp_server = self.udp_server;
+    pub async fn connect(&self, remote_server: SocketAddr) -> anyhow::Result<UdpTunnel> {
+        let endpoint = &self.endpoint;
+        let udp_server = self.udp_server.clone();
         info!("QUIC client connecting to {remote_server}...");
         let connection = endpoint.connect(remote_server, SERVER_NAME)?.await?;
         let tunnel = UdpTunnel {
             udp_server,
             preset_udp_destination: None,
-            endpoint,
             connection,
         };
         Ok(tunnel)
@@ -116,16 +114,14 @@ impl Client {
 }
 
 pub struct UdpTunnel {
-    udp_server: UdpSocket,
+    udp_server: Arc<UdpSocket>,
     preset_udp_destination: Option<SocketAddr>,
-    #[allow(dead_code)]
-    endpoint: Endpoint,
     connection: Connection,
 }
 
 impl UdpTunnel {
     pub async fn run(self) -> anyhow::Result<()> {
-        let udp_server_1 = Arc::new(self.udp_server);
+        let udp_server_1 = self.udp_server;
         let udp_server_2 = Arc::clone(&udp_server_1);
         let (new_udp_destination_sender, mut new_udp_destination_receiver) =
             tokio::sync::mpsc::channel(10);
