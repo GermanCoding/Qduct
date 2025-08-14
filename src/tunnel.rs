@@ -1,27 +1,64 @@
+use base256::{Encode, PgpEncode};
 use bytes::BytesMut;
-use quinn::crypto::rustls::QuicClientConfig;
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use quinn::rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
-use quinn::{rustls, Connection, Endpoint, ServerConfig};
+use quinn::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use quinn::rustls::{
+    ClientConfig, DigitallySignedStruct, DistinguishedName, Error, SignatureScheme,
+};
+use quinn::{rustls, Connection, Endpoint, ServerConfig, VarInt};
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
-use tracing::log::info;
+use tracing::log::{info, warn};
 
 const BUF_SIZE: usize = 1500;
 const MAX_STREAMS: u16 = 1024;
-const SERVER_NAME: &str = "Qduct";
+const CERT_NAME: &str = "Qduct";
+const COMPARE_HASH_BYTES: usize = 8;
+
+fn new_keypair() -> anyhow::Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> {
+    let keypair = rcgen::generate_simple_self_signed(vec![CERT_NAME.into()])?;
+    let certificate = CertificateDer::from(keypair.cert);
+    let priv_key = PrivatePkcs8KeyDer::from(keypair.signing_key.serialize_der());
+    Ok((certificate, priv_key))
+}
+
+pub trait CertificateByteWords {
+    fn get_bytewords(&self) -> String;
+}
+
+impl CertificateByteWords for CertificateDer<'_> {
+    fn get_bytewords(&self) -> String {
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(self.as_ref());
+        let cert_hash = ctx.finish();
+        let hash_truncated = cert_hash.as_ref()[..COMPARE_HASH_BYTES].bytes();
+        let encoded = Encode::<_, PgpEncode<_>>::encode(hash_truncated);
+        let mut words = String::new();
+        for word in encoded {
+            if !words.is_empty() {
+                words.push(' ');
+            }
+            words.push_str(word.unwrap());
+        }
+        words
+    }
+}
 
 pub struct Server {
     endpoint: Endpoint,
     udp_server: Arc<UdpSocket>,
     udp_destination: SocketAddr,
     pub certificate: CertificateDer<'static>,
+    shutdown: CancellationToken,
 }
 
 impl Server {
@@ -35,11 +72,12 @@ impl Server {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
         let udp_server = Arc::new(UdpSocket::bind((bind_ip, 0)).await?);
-        let keypair = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()])?;
-        let certificate = CertificateDer::from(keypair.cert);
-        let priv_key = PrivatePkcs8KeyDer::from(keypair.signing_key.serialize_der());
+        let (certificate, priv_key) = new_keypair()?;
+        let crypto_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(InteractiveCertificateVerifier::new())
+            .with_single_cert([certificate.clone()].to_vec(), priv_key.into())?;
         let mut config =
-            ServerConfig::with_single_cert([certificate.clone()].to_vec(), priv_key.into())?;
+            ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto_config)?));
         let transport = Arc::get_mut(&mut config.transport).unwrap(/* Infallible*/);
         transport.max_concurrent_uni_streams(MAX_STREAMS.into());
         transport.keep_alive_interval(Some(Duration::from_secs(25)));
@@ -50,6 +88,7 @@ impl Server {
             udp_server,
             udp_destination,
             certificate,
+            shutdown: CancellationToken::new(),
         })
     }
 
@@ -68,23 +107,33 @@ impl Server {
             udp_server,
             preset_udp_destination: Some(self.udp_destination),
             connection,
+            shutdown: self.shutdown.child_token(),
         };
         Ok(tunnel)
+    }
+
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        self.endpoint.close(VarInt::from_u32(0), &[]);
+        self.endpoint.wait_idle().await;
     }
 }
 
 pub struct Client {
     udp_server: Arc<UdpSocket>,
     endpoint: Endpoint,
+    pub certificate: CertificateDer<'static>,
+    shutdown: CancellationToken,
 }
 
 impl Client {
     pub async fn try_new(udp_sink: SocketAddr) -> anyhow::Result<Self> {
         let udp_server = Arc::new(UdpSocket::bind(udp_sink).await?);
+        let (certificate, priv_key) = new_keypair()?;
         let config = ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(BypassCertificateVerifier::new())
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(InteractiveCertificateVerifier::new())
+            .with_client_auth_cert([certificate.clone()].to_vec(), priv_key.into())?;
         let mut quic_config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config)?));
         let mut transport_config = quinn::TransportConfig::default();
@@ -96,6 +145,8 @@ impl Client {
         Ok(Self {
             udp_server,
             endpoint,
+            certificate,
+            shutdown: CancellationToken::new(),
         })
     }
 
@@ -103,13 +154,20 @@ impl Client {
         let endpoint = &self.endpoint;
         let udp_server = self.udp_server.clone();
         info!("QUIC client connecting to {remote_server}...");
-        let connection = endpoint.connect(remote_server, SERVER_NAME)?.await?;
+        let connection = endpoint.connect(remote_server, CERT_NAME)?.await?;
         let tunnel = UdpTunnel {
             udp_server,
             preset_udp_destination: None,
             connection,
+            shutdown: self.shutdown.child_token(),
         };
         Ok(tunnel)
+    }
+
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        self.endpoint.close(VarInt::from_u32(0), &[]);
+        self.endpoint.wait_idle().await;
     }
 }
 
@@ -117,10 +175,12 @@ pub struct UdpTunnel {
     udp_server: Arc<UdpSocket>,
     preset_udp_destination: Option<SocketAddr>,
     connection: Connection,
+    shutdown: CancellationToken,
 }
 
 impl UdpTunnel {
     pub async fn run(self) -> anyhow::Result<()> {
+        let shutdown = self.shutdown;
         let udp_server_1 = self.udp_server;
         let udp_server_2 = Arc::clone(&udp_server_1);
         let (new_udp_destination_sender, mut new_udp_destination_receiver) =
@@ -177,34 +237,124 @@ impl UdpTunnel {
                 }
             });
 
+        let abort_udp_receive = udp_receive.abort_handle();
+        let abort_quic_send = quic_send.abort_handle();
+        let abort_quic_receive = quic_receive.abort_handle();
+
         tokio::select! {
             udp_receive = udp_receive => udp_receive??,
             quic_send = quic_send => quic_send??,
-            quic_receive = quic_receive => quic_receive??
+            quic_receive = quic_receive => quic_receive??,
+            _ = shutdown.cancelled() => {
+                abort_udp_receive.abort();
+                abort_quic_send.abort();
+                abort_quic_receive.abort();
+            }
         }
         Ok(())
     }
 }
 
 #[derive(Debug)]
-struct BypassCertificateVerifier(Arc<rustls::crypto::CryptoProvider>);
+struct InteractiveCertificateVerifier(Arc<rustls::crypto::CryptoProvider>);
 
-impl BypassCertificateVerifier {
+impl InteractiveCertificateVerifier {
     fn new() -> Arc<Self> {
         Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
     }
+
+    #[cfg(not(test))]
+    fn verify(certificate: &CertificateDer<'_>) -> anyhow::Result<()> {
+        let words = certificate.get_bytewords();
+        println!("Please verify the certificate words with your peer:");
+        let confirmed = inquire::Confirm::new(&words).with_default(false).prompt()?;
+        if confirmed {
+            Ok(())
+        } else {
+            anyhow::bail!("Verification denied by user")
+        }
+    }
+
+    #[cfg(test)]
+    fn verify(_certificate: &CertificateDer<'_>) -> anyhow::Result<()> {
+        // Disable certificate verification in tests
+        Ok(())
+    }
 }
 
-impl ServerCertVerifier for BypassCertificateVerifier {
+impl ServerCertVerifier for InteractiveCertificateVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        Ok(ServerCertVerified::assertion())
+        match InteractiveCertificateVerifier::verify(end_entity) {
+            Ok(()) => Ok(ServerCertVerified::assertion()),
+            Err(e) => {
+                warn!("Server certificate not verified: {e:#}");
+                Err(Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+impl ClientCertVerifier for InteractiveCertificateVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        match InteractiveCertificateVerifier::verify(end_entity) {
+            Ok(()) => Ok(ClientCertVerified::assertion()),
+            Err(e) => {
+                warn!("Client certificate not verified: {e:#}");
+                Err(Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))
+            }
+        }
     }
 
     fn verify_tls12_signature(

@@ -1,7 +1,8 @@
 use clap::Parser;
-use qduct::tunnel::Client;
+use qduct::tunnel::{CertificateByteWords, Client};
 use std::net::SocketAddr;
-use tracing::log::{info, warn};
+use tokio::signal;
+use tracing::log::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,18 +13,33 @@ async fn main() -> anyhow::Result<()> {
         args.local_source
     );
     let client = Client::try_new(args.local_source).await?;
+    let words = client.certificate.get_bytewords();
+    info!("Your certificate words are: {words}");
     loop {
         let tunnel = client.connect(args.remote).await?;
         info!("Connected! Forwarding data...");
-        match tunnel.run().await {
-            Ok(()) => {
-                info!("Connection closed.");
-            }
-            Err(e) => {
-                warn!("Connection failed: {e:#}");
+        tokio::select! {
+            abort = signal::ctrl_c() => {
+                if let Err(err) = abort {
+                    error!("Unable to listen for shutdown signal, shutting down: {}", err);
+                }
+                info!("Shutting down running connection...");
+                client.shutdown().await;
+                break;
+            },
+            result = tunnel.run() => {
+                match result {
+                    Ok(()) => {
+                        info!("Connection closed.");
+                    }
+                    Err(e) => {
+                        warn!("Connection failed: {e:#}");
+                    }
+                }
             }
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, clap::Parser)]
