@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = ServerArgs::parse();
     info!("Sending received packets to {}", args.local_sink);
-    let server = Server::try_new(args.server, args.local_sink).await?;
+    let server = Server::try_new(args.server, args.local_sink, args.common).await?;
     let words = server.certificate.get_bytewords();
     info!("Your certificate words are: {words}");
     loop {

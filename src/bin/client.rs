@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
         "Listening for incoming UDP packets on {}",
         args.local_source
     );
-    let client = Client::try_new(args.local_source).await?;
+    let client = Client::try_new(args.local_source, args.common).await?;
     let words = client.certificate.get_bytewords();
     info!("Your certificate words are: {words}");
     loop {

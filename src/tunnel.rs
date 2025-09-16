@@ -1,3 +1,4 @@
+use crate::CommonArgs;
 use base256::{Encode, PgpEncode};
 use bytes::BytesMut;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -65,6 +66,7 @@ impl Server {
     pub async fn try_new(
         quic_addr: SocketAddr,
         udp_destination: SocketAddr,
+        options: CommonArgs,
     ) -> anyhow::Result<Self> {
         let bind_ip = if udp_destination.ip().is_ipv6() {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
@@ -74,7 +76,7 @@ impl Server {
         let udp_server = Arc::new(UdpSocket::bind((bind_ip, 0)).await?);
         let (certificate, priv_key) = new_keypair()?;
         let crypto_config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(InteractiveCertificateVerifier::new())
+            .with_client_cert_verifier(InteractiveCertificateVerifier::new(options.trust))
             .with_single_cert([certificate.clone()].to_vec(), priv_key.into())?;
         let mut config =
             ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto_config)?));
@@ -127,12 +129,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn try_new(udp_sink: SocketAddr) -> anyhow::Result<Self> {
+    pub async fn try_new(udp_sink: SocketAddr, options: CommonArgs) -> anyhow::Result<Self> {
         let udp_server = Arc::new(UdpSocket::bind(udp_sink).await?);
         let (certificate, priv_key) = new_keypair()?;
         let config = ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(InteractiveCertificateVerifier::new())
+            .with_custom_certificate_verifier(InteractiveCertificateVerifier::new(options.trust))
             .with_client_auth_cert([certificate.clone()].to_vec(), priv_key.into())?;
         let mut quic_config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config)?));
@@ -256,15 +258,23 @@ impl UdpTunnel {
 }
 
 #[derive(Debug)]
-struct InteractiveCertificateVerifier(Arc<rustls::crypto::CryptoProvider>);
+struct InteractiveCertificateVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    skip_verify: bool,
+}
 
 impl InteractiveCertificateVerifier {
-    fn new() -> Arc<Self> {
-        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    fn new(skip_verify: bool) -> Arc<Self> {
+        Arc::new(Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            skip_verify,
+        })
     }
 
-    #[cfg(not(test))]
-    fn verify(certificate: &CertificateDer<'_>) -> anyhow::Result<()> {
+    fn verify(&self, certificate: &CertificateDer<'_>) -> anyhow::Result<()> {
+        if self.skip_verify {
+            return Ok(());
+        }
         let words = certificate.get_bytewords();
         println!("Please verify the certificate words with your peer:");
         let confirmed = inquire::Confirm::new(&words).with_default(false).prompt()?;
@@ -273,12 +283,6 @@ impl InteractiveCertificateVerifier {
         } else {
             anyhow::bail!("Verification denied by user")
         }
-    }
-
-    #[cfg(test)]
-    fn verify(_certificate: &CertificateDer<'_>) -> anyhow::Result<()> {
-        // Disable certificate verification in tests
-        Ok(())
     }
 }
 
@@ -291,7 +295,7 @@ impl ServerCertVerifier for InteractiveCertificateVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        match InteractiveCertificateVerifier::verify(end_entity) {
+        match self.verify(end_entity) {
             Ok(()) => Ok(ServerCertVerified::assertion()),
             Err(e) => {
                 warn!("Server certificate not verified: {e:#}");
@@ -312,7 +316,7 @@ impl ServerCertVerifier for InteractiveCertificateVerifier {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -326,12 +330,14 @@ impl ServerCertVerifier for InteractiveCertificateVerifier {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -346,7 +352,7 @@ impl ClientCertVerifier for InteractiveCertificateVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        match InteractiveCertificateVerifier::verify(end_entity) {
+        match self.verify(end_entity) {
             Ok(()) => Ok(ClientCertVerified::assertion()),
             Err(e) => {
                 warn!("Client certificate not verified: {e:#}");
@@ -367,7 +373,7 @@ impl ClientCertVerifier for InteractiveCertificateVerifier {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -381,12 +387,14 @@ impl ClientCertVerifier for InteractiveCertificateVerifier {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -408,9 +416,13 @@ mod tests {
     async fn setup_client_and_server() -> TestConfig {
         let udp_server = UdpSocket::bind(UNSPECIFIED_ADDR).await.unwrap();
         let udp_server_addr = udp_server.local_addr().unwrap();
-        let server = Server::try_new(UNSPECIFIED_ADDR, udp_server_addr)
-            .await
-            .unwrap();
+        let server = Server::try_new(
+            UNSPECIFIED_ADDR,
+            udp_server_addr,
+            CommonArgs { trust: true },
+        )
+        .await
+        .unwrap();
         udp_server
             .connect((
                 Ipv4Addr::LOCALHOST,
@@ -423,7 +435,9 @@ mod tests {
             let tunnel = server.accept().await.unwrap();
             tunnel.run().await.unwrap();
         });
-        let client = Client::try_new(UNSPECIFIED_ADDR).await.unwrap();
+        let client = Client::try_new(UNSPECIFIED_ADDR, CommonArgs { trust: true })
+            .await
+            .unwrap();
         let client_socket = UdpSocket::bind(UNSPECIFIED_ADDR).await.unwrap();
         client_socket
             .connect((
