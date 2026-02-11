@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 base256 = { version = "0.4.2", features = ["encode_pgp"] }
-bytes = "1.10.1"
+bytes = "1.11.1"
 clap = { version = "4.5.41", features = ["derive"] }
 inquire = "0.9.1"
 quinn = "0.11.9"
